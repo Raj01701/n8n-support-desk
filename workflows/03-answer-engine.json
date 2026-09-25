@@ -1,0 +1,498 @@
+{
+  "name": "03 - Answer Engine (shared backend)",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1120,
+        300
+      ],
+      "id": "t-0001-4a1b-9c2d-000000000001",
+      "name": "When Called By Another Workflow",
+      "notes": "The shared backend. Workflow 01 (Gmail) and workflow 02 (live chat) both call THIS workflow - not a copy of it - so a change to how the desk answers is one edit in one place, and the two channels can never drift apart. Input: { channel, text, session_or_thread_id, history[] }."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The contract with both callers, enforced here rather than trusted.\n// Anything downstream that reads a field this node did not set is a bug.\nconst crypto = require('crypto');\n\nconst input = $input.first().json ?? {};\n\nconst channel = String(input.channel || '').trim();\nif (channel !== 'email' && channel !== 'chat') {\n  throw new Error('channel must be \"email\" or \"chat\", got: ' + JSON.stringify(input.channel));\n}\n\nconst text = String(input.text || '').trim();\nif (!text) throw new Error('the answer engine was called with an empty question');\n\nconst conversationRef = String(input.session_or_thread_id || '').trim();\nif (!conversationRef) throw new Error('session_or_thread_id is required so the answer can be traced back');\n\n// History arrives oldest-first and is only ever used as context for the model.\n// It is capped here because a long transcript pushes the retrieved passages out\n// of the model's attention, which is the opposite of what it is for.\nconst history = (Array.isArray(input.history) ? input.history : [])\n  .filter((turn) => turn && turn.content)\n  .slice(-12)\n  .map((turn) => ({\n    role: turn.role === 'agent' || turn.role === 'assistant' ? 'agent' : 'visitor',\n    content: String(turn.content).slice(0, 1500),\n  }));\n\n// The retrieval query is not the raw email. Quoted reply blocks, signatures and\n// disclaimers are most of the text in a threaded email and none of the meaning;\n// left in, they match every article that mentions \"regards\" and rank the real\n// answer below the noise.\nconst retrievalQuery = text\n  .split(/\\n\\s*(?:On .*wrote:|-{2,}\\s*Original Message|_{5,}|--\\s*$)/m)[0]\n  .split(/\\n\\s*>/)[0]\n  .replace(/\\s+/g, ' ')\n  .trim()\n  .slice(0, 400);\n\n// A follow-up question is short and pronoun-shaped: \"and what does that cost?\"\n// shares no word with any article, so retrieval on its own finds nothing and the\n// desk looks like it has forgotten the conversation it is in. Expanding the\n// query with the visitor's PREVIOUS message is what makes the second question in\n// a thread findable at all.\n//\n// Only the previous visitor turn, never the agent's reply: the agent's reply was\n// written out of an article, so feeding it back in retrieves that same article\n// whatever was actually asked next.\nconst lastVisitorTurn = [...history].reverse().find((t) => t.role === 'visitor');\nconst expandedQuery = (lastVisitorTurn ? retrievalQuery + ' ' + lastVisitorTurn.content : retrievalQuery)\n  .replace(/s+/g, ' ')\n  .trim()\n  .slice(0, 600);\n\nconst normalisedQuestion = retrievalQuery.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\\s+/g, ' ').trim();\n\nreturn [\n  {\n    json: {\n      channel,\n      question: text.slice(0, 4000),\n      retrieval_query: expandedQuery,\n      retrieval_query_own_words: retrievalQuery,\n      question_hash: crypto.createHash('sha256').update(normalisedQuestion).digest('hex'),\n      conversation_ref: conversationRef,\n      history,\n      history_turns: history.length,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -900,
+        300
+      ],
+      "id": "c-0002-4a1b-9c2d-000000000002",
+      "name": "Normalise Request",
+      "notes": "Validates the contract and builds the retrieval query. Splitting the quoted reply block off the bottom of an email is what keeps thread number three from retrieving the same articles as thread number one."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Postgres full-text search over the business knowledge base.\n--\n-- The query is ORed, not ANDed. plainto_tsquery and websearch_to_tsquery both\n-- join every word with &, which means one unusual word anywhere in a customer's\n-- sentence excludes the article that answers them: \"I was charged twice this\n-- month, can I get a refund?\" ANDs charged & twice & month & refund and matches\n-- nothing at all. Swapping & for | turns it into what a search box does - match\n-- anything, then rank - and the ranking plus the floor in the next node are what\n-- keep the noise out.\n--\n-- Built by rewriting plainto_tsquery's OUTPUT rather than by assembling a\n-- tsquery from the raw string: plainto_tsquery has already stemmed the words and\n-- discarded every operator character, so nothing a customer can type reaches\n-- to_tsquery as syntax.\n--\n-- ts_rank reads the weights set on articles.search_tsv, so a title match beats a\n-- passing mention in a body. The floor that decides \"no match at all\" is applied\n-- in the next node, not here, because it has to be visible in the execution.\nWITH q AS (\n  SELECT nullif(replace(plainto_tsquery('english', $1)::text, '&', '|'), '')::tsquery AS tsq\n)\nSELECT a.id,\n       a.slug,\n       a.title,\n       a.category,\n       left(a.body, 1500) AS passage,\n       round(ts_rank(a.search_tsv, q.tsq)::numeric, 6) AS relevance\n  FROM articles a, q\n WHERE q.tsq IS NOT NULL\n   AND a.search_tsv @@ q.tsq\n ORDER BY relevance DESC, a.updated_at DESC\n LIMIT $2::int;",
+        "options": {
+          "queryReplacement": "={{ [ $json.retrieval_query, Number($env.KB_TOP_K) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -680,
+        300
+      ],
+      "id": "p-0003-4a1b-9c2d-000000000003",
+      "name": "Retrieve Passages",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "Real retrieval against a real index - no vector database, and honest about being lexical. A question with no lexical overlap with any article returns zero rows, which is the missing-knowledge case the brief asks for, arriving as data rather than as an error."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Zero rows is a state, not silence. `alwaysOutputData` on the node above means\n// a question that matched nothing still arrives here as one empty item, so the\n// IF below can route it instead of the branch quietly ending.\nconst floor = Number($env.KB_RELEVANCE_FLOOR || 0);\nconst request = $('Normalise Request').first().json;\n\nconst rows = $input.all().map((i) => i.json).filter((r) => r && r.id !== undefined);\nconst kept = rows.filter((r) => Number(r.relevance) >= floor);\n\nconst passages = kept.map((r) => ({\n  id: Number(r.id),\n  slug: r.slug,\n  title: r.title,\n  passage: r.passage,\n  relevance: Number(r.relevance),\n}));\n\nreturn [\n  {\n    json: {\n      ...request,\n      passages,\n      retrieved_count: rows.length,\n      kept_count: passages.length,\n      top_relevance: passages.length ? passages[0].relevance : 0,\n      relevance_floor: floor,\n      has_context: passages.length > 0,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        300
+      ],
+      "id": "c-0004-4a1b-9c2d-000000000004",
+      "name": "Apply Relevance Floor",
+      "notes": "The floor is what turns a bad retrieval into an honest \"I do not know\" instead of a confident wrong answer built out of a loosely related article."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-anything-retrieved--0",
+              "leftValue": "={{ $json.has_context }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -240,
+        300
+      ],
+      "id": "i-0005-4a1b-9c2d-000000000005",
+      "name": "Anything Retrieved?",
+      "notes": "True: there is at least one passage above the floor to answer from. False: the knowledge base has nothing on this, which is a documented outcome, not a failure."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_API_BASE }}/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $env.LLM_MODEL }}\",\n  \"temperature\": 0,\n  \"max_tokens\": 600,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are the support agent for a business. You answer ONLY from the help-centre passages you are given in this message.\\n\\nRules, in order of priority:\\n1. If the passages do not contain the answer, set answered_from_kb to false, leave answer empty, and put what is missing in missing_info. Do not answer from general knowledge. Do not guess. An honest \\\"we do not have that documented\\\" is the correct output and is never a failure.\\n2. If they do contain it, write the answer in plain language, 2-4 sentences, no greeting and no sign-off - the workflow adds those. State only facts that appear in the passages.\\n3. used_article_ids must list the id of every passage you actually used, and nothing else. An id you did not use is a false citation.\\n4. Never invent prices, dates, timeframes, policies or URLs. If the customer asks for a number the passages do not give, that is missing_info.\\n5. Never promise a refund, a credit, a discount, an exception or anything else that moves money. Say that a person will confirm it.\\n6. Answer in the language the customer wrote in.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify(\n    '<question>\\n' + $json.question + '\\n</question>\\n\\n' +\n    '<history>\\n' + ($json.history || []).map(t => t.role + ': ' + t.content).join('\\n') + '\\n</history>\\n\\n' +\n    '<passages>\\n' + JSON.stringify(($json.passages || []).map(p => ({ id: p.id, title: p.title, passage: p.passage })), null, 1) + '\\n</passages>'\n  ) }}\n    }\n  ],\n  \"response_format\": {\n    \"type\": \"json_schema\",\n    \"json_schema\": {\n      \"name\": \"kb_answer\",\n      \"strict\": true,\n      \"schema\": {\n        \"type\": \"object\",\n        \"additionalProperties\": false,\n        \"required\": [\n          \"answer\",\n          \"used_article_ids\",\n          \"answered_from_kb\",\n          \"missing_info\"\n        ],\n        \"properties\": {\n          \"answer\": {\n            \"type\": \"string\"\n          },\n          \"used_article_ids\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"integer\"\n            }\n          },\n          \"answered_from_kb\": {\n            \"type\": \"boolean\"\n          },\n          \"missing_info\": {\n            \"type\": \"string\"\n          }\n        }\n      }\n    }\n  }\n}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        0,
+        220
+      ],
+      "id": "h-0006-4a1b-9c2d-000000000006",
+      "name": "Answer From Passages",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": null,
+          "name": "LLM API Key"
+        }
+      },
+      "notes": "The model sees the retrieved passages and nothing else - no store of its own, no browsing, no earlier context beyond the history turns. That is what \"grounded\" means here, and it is enforced again in Validate Answer, because a prompt is a request and not a guarantee."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// A strict json_schema response is a contract the provider enforces, not one we\n// can assume held: a proxy, a rate limiter or an outage can put something else\n// entirely in the body. Parsing defensively here is what turns \"the model went\n// weird\" into a failed execution with a readable reason.\nconst context = $('Apply Relevance Floor').first().json;\nconst raw = $input.first().json;\n\nconst content = raw?.choices?.[0]?.message?.content;\nif (typeof content !== 'string') {\n  throw new Error(\n    'The model endpoint did not return a chat completion. Body began: ' +\n      JSON.stringify(raw).slice(0, 300),\n  );\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(content);\n} catch (err) {\n  throw new Error('The model returned content that is not JSON: ' + content.slice(0, 300));\n}\n\nconst retrievedIds = (context.passages || []).map((p) => p.id);\n\n// The one rule the prompt cannot be trusted to keep. An id the model cited that\n// was never retrieved is dropped, and an answer left with no citation at all is\n// not grounded regardless of what the model said about itself.\nconst citedIds = Array.isArray(parsed.used_article_ids) ? parsed.used_article_ids.map(Number) : [];\nconst usedIds = citedIds.filter((articleId) => retrievedIds.includes(articleId));\nconst hallucinatedIds = citedIds.filter((articleId) => !retrievedIds.includes(articleId));\n\nconst answerText = String(parsed.answer || '').trim();\nconst grounded = parsed.answered_from_kb === true && answerText.length > 0 && usedIds.length > 0;\n\n// Confidence is NOT the model's opinion of its own answer - a model asked to\n// score itself says 0.9 to anything. It is built from what the workflow can\n// observe: how strongly the article it actually used matched the question.\n// 0.45 is a solid single-article ts_rank on the seeded corpus - measured, not\n// guessed: a real match there scores 0.24 to 0.70 and incidental overlap scores\n// 0.04. Anything at or above 0.45 is treated as full retrieval confidence, and\n// a half-match lands around 0.75, just above the default gate. Re-measure this\n// against the client's own articles; it is corpus-specific.\nconst usedRelevance = Math.max(\n  0,\n  ...(context.passages || []).filter((p) => usedIds.includes(p.id)).map((p) => p.relevance),\n);\nconst retrievalScore = Math.min(1, usedRelevance / 0.45);\nconst confidence = grounded ? Math.round((0.55 + 0.4 * retrievalScore) * 1000) / 1000 : 0;\n\nreturn [\n  {\n    json: {\n      ...context,\n      grounded,\n      answer: grounded ? answerText : null,\n      confidence,\n      used_article_ids: usedIds,\n      hallucinated_article_ids: hallucinatedIds,\n      model_said_answered: parsed.answered_from_kb === true,\n      missing_info: String(parsed.missing_info || '').slice(0, 500),\n      used_relevance: usedRelevance,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        220
+      ],
+      "id": "c-0007-4a1b-9c2d-000000000007",
+      "name": "Validate Answer",
+      "notes": "Parses the response, drops any citation the model invented, and derives the confidence the gate upstream reads. A model that claims it answered but cites nothing is not grounded here."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-answered-from-the-knowledge-base--0",
+              "leftValue": "={{ $json.grounded }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        220
+      ],
+      "id": "i-0008-4a1b-9c2d-000000000008",
+      "name": "Answered From The Knowledge Base?",
+      "notes": "The missing-knowledge branch. False means retrieval found articles but none of them contained the answer - a different gap from \"nothing matched at all\", and both are recorded with their own reason."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The contract returned to whichever workflow called this one.\nconst r = $input.first().json;\nreturn [\n  {\n    json: {\n      grounded: true,\n      answer: r.answer,\n      confidence: r.confidence,\n      used_article_ids: r.used_article_ids,\n      escalate_reason: null,\n      channel: r.channel,\n      question: r.question,\n      conversation_ref: r.conversation_ref,\n      question_hash: r.question_hash,\n      retrieved_count: r.retrieved_count,\n      top_relevance: r.top_relevance,\n      integration_error: null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        120
+      ],
+      "id": "c-0009-4a1b-9c2d-000000000009",
+      "name": "Result: Grounded Answer"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Retrieval returned nothing above KB_RELEVANCE_FLOOR. The business has not\n// written this article yet. That is worth knowing, so it is recorded rather\n// than logged and forgotten.\nconst r = $input.first().json;\nreturn [\n  {\n    json: {\n      grounded: false,\n      answer: null,\n      confidence: 0,\n      used_article_ids: [],\n      escalate_reason: 'no_matching_article',\n      channel: r.channel,\n      question: r.question,\n      conversation_ref: r.conversation_ref,\n      question_hash: r.question_hash,\n      retrieved_count: r.retrieved_count,\n      top_relevance: r.top_relevance,\n      missing_info: 'No help-centre article matched this question above the relevance floor.',\n      integration_error: null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        460
+      ],
+      "id": "c-0010-4a1b-9c2d-000000000010",
+      "name": "Result: No Article Matched"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Articles were retrieved, and none of them contained the answer. A subtler gap\n// than \"nothing matched\": the topic exists in the help centre but this specific\n// question is not covered by it.\nconst r = $input.first().json;\nreturn [\n  {\n    json: {\n      grounded: false,\n      answer: null,\n      confidence: 0,\n      used_article_ids: [],\n      escalate_reason: 'not_answerable_from_kb',\n      channel: r.channel,\n      question: r.question,\n      conversation_ref: r.conversation_ref,\n      question_hash: r.question_hash,\n      retrieved_count: r.retrieved_count,\n      top_relevance: r.top_relevance,\n      missing_info: r.missing_info || 'The retrieved articles do not cover this question.',\n      integration_error: null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        340
+      ],
+      "id": "c-0011-4a1b-9c2d-000000000011",
+      "name": "Result: Not Answerable From The Knowledge Base"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The model endpoint failed all three attempts. The engine returns \"not\n// grounded\" rather than throwing, so the caller's own confidence gate turns an\n// outage into a human handover instead of into a failed execution and a silent\n// customer. The reason is different from a knowledge gap, and is kept different\n// all the way into the decision log.\nconst context = $('Apply Relevance Floor').first().json;\nconst failure = $input.first().json?.error ?? {};\n\nreturn [\n  {\n    json: {\n      grounded: false,\n      answer: null,\n      confidence: 0,\n      used_article_ids: [],\n      escalate_reason: 'answer_engine_unavailable',\n      channel: context.channel,\n      question: context.question,\n      conversation_ref: context.conversation_ref,\n      question_hash: context.question_hash,\n      retrieved_count: context.retrieved_count,\n      top_relevance: context.top_relevance,\n      missing_info: null,\n      integration_error: String(failure.message || failure.description || 'model endpoint unavailable').slice(0, 400),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        460
+      ],
+      "id": "c-0012-4a1b-9c2d-000000000012",
+      "name": "Result: Answer Engine Unavailable"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One named upstream for the three ways an answer can fail to be grounded, so\n// the nodes below can be written once instead of three times.\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        460
+      ],
+      "id": "c-0013-4a1b-9c2d-000000000013",
+      "name": "Ungrounded Result",
+      "notes": "A junction, not a transform. The three ungrounded branches meet here so the unanswered-questions write and the return contract are each defined in exactly one place."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The knowledge base's own to-do list.\n--\n-- ON CONFLICT DO UPDATE, not DO NOTHING: the same question asked fifty times\n-- must be one row with asked_count = 50, not fifty rows nobody reads. The\n-- counter is the whole value of the table - it says which article to write next.\n--\n-- The WHERE clause keeps an outage out of the gap list. A model that was down is\n-- not a question the help centre failed to answer, and mixing the two would make\n-- the list untrustworthy on the one day it matters.\nINSERT INTO unanswered_questions (question_hash, question, channel, conversation_ref, reason)\nSELECT $1, $2, $3, $4, $5\n WHERE $5 IN ('no_matching_article', 'not_answerable_from_kb')\n    ON CONFLICT (question_hash) DO UPDATE\n   SET asked_count   = unanswered_questions.asked_count + 1,\n       last_asked_at = now()\nRETURNING id, asked_count;",
+        "options": {
+          "queryReplacement": "={{ [ $json.question_hash, $json.question, $json.channel, $json.conversation_ref, $json.escalate_reason ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1100,
+        460
+      ],
+      "id": "p-0014-4a1b-9c2d-000000000014",
+      "name": "Record Unanswered Question",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "Writes nothing when the reason was an outage, which is why alwaysOutputData is on: the branch must keep moving even when the INSERT ... SELECT ... WHERE inserts no row."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Both branches leave through here, so Execute Workflow always hands the caller\n// the same shape whatever happened inside.\nconst item = $input.first().json ?? {};\n\n// The grounded branch arrives carrying the contract already.\nif (item.grounded === true) return [{ json: item }];\n\n// The ungrounded branch arrives carrying the unanswered_questions row instead,\n// so the contract is rebuilt from the junction node above.\nconst base = $('Ungrounded Result').first().json;\nreturn [\n  {\n    json: {\n      ...base,\n      unanswered_question_id: item.id ?? null,\n      times_asked: item.asked_count ?? null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "id": "c-0015-4a1b-9c2d-000000000015",
+      "name": "Return To Caller",
+      "notes": "Returns { grounded, answer, confidence, used_article_ids, escalate_reason, ... }. Workflows 01 and 02 both gate on exactly these fields."
+    }
+  ],
+  "connections": {
+    "When Called By Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Normalise Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Request": {
+      "main": [
+        [
+          {
+            "node": "Retrieve Passages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieve Passages": {
+      "main": [
+        [
+          {
+            "node": "Apply Relevance Floor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Relevance Floor": {
+      "main": [
+        [
+          {
+            "node": "Anything Retrieved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything Retrieved?": {
+      "main": [
+        [
+          {
+            "node": "Answer From Passages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result: No Article Matched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer From Passages": {
+      "main": [
+        [
+          {
+            "node": "Validate Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result: Answer Engine Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Answer": {
+      "main": [
+        [
+          {
+            "node": "Answered From The Knowledge Base?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answered From The Knowledge Base?": {
+      "main": [
+        [
+          {
+            "node": "Result: Grounded Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result: Not Answerable From The Knowledge Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result: Grounded Answer": {
+      "main": [
+        [
+          {
+            "node": "Return To Caller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result: No Article Matched": {
+      "main": [
+        [
+          {
+            "node": "Ungrounded Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result: Not Answerable From The Knowledge Base": {
+      "main": [
+        [
+          {
+            "node": "Ungrounded Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result: Answer Engine Unavailable": {
+      "main": [
+        [
+          {
+            "node": "Ungrounded Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ungrounded Result": {
+      "main": [
+        [
+          {
+            "node": "Record Unanswered Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Unanswered Question": {
+      "main": [
+        [
+          {
+            "node": "Return To Caller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_WITH_WORKFLOW_04_ID",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 300
+  },
+  "pinData": {}
+}

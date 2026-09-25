@@ -1,0 +1,136 @@
+{
+  "name": "04 - Error Trigger Alerts",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -560,
+        300
+      ],
+      "id": "t-0001-4a1b-9c2d-000000000001",
+      "name": "Error Trigger",
+      "notes": "Set as the Error workflow on workflows 01, 02 and 03 (Workflow settings > Error workflow). It fires once per failed execution, including failed retries. It must never point at itself, or a failure in here loops on its own failures."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The Error Trigger receives one item describing the failed execution:\n//   { execution: { id, url, error, lastNodeExecuted, mode, retryOf },\n//     workflow:  { id, name } }\n// A workflow that fails before any node runs sends { trigger: { error } } instead.\nconst payload = $input.first().json;\n\nconst workflow = payload.workflow || {};\nconst execution = payload.execution || {};\nconst trigger = payload.trigger || {};\nconst error = execution.error || trigger.error || {};\n\nconst failedNode = error?.node?.name || execution.lastNodeExecuted || 'trigger / before first node';\nconst message = error.message || 'n8n supplied no error message';\n\n// The item that was in flight when the node threw is the most useful thing in\n// the whole alert, and the thing nobody thinks to include.\nconst context = error.context || {};\nconst excerpt = JSON.stringify(context.data ?? context ?? {}).slice(0, 900);\n\nreturn [\n  {\n    json: {\n      workflow_id: workflow.id || null,\n      workflow_name: workflow.name || 'unknown',\n      execution_id: execution.id ? String(execution.id) : null,\n      execution_url: execution.url || null,\n      failed_node: failedNode,\n      error_name: error.name || 'Error',\n      error_message: String(message).slice(0, 2000),\n      error_description: error.description || null,\n      error_stack: String(error.stack || '').slice(0, 2000) || null,\n      execution_mode: execution.mode || null,\n      retry_of: execution.retryOf || null,\n      input_excerpt: excerpt,\n      occurred_at: new Date().toISOString(),\n      slack_payload: {\n        text: 'Support desk workflow failed: ' + (workflow.name || 'unknown'),\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: 'Support desk workflow failed' } },\n          {\n            type: 'section',\n            fields: [\n              { type: 'mrkdwn', text: '*Workflow*\\n' + (workflow.name || 'unknown') },\n              { type: 'mrkdwn', text: '*Failing node*\\n' + failedNode },\n              { type: 'mrkdwn', text: '*Execution*\\n' + (execution.id || 'n/a') },\n              { type: 'mrkdwn', text: '*Mode*\\n' + (execution.mode || 'unknown') },\n            ],\n          },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Error*\\n' + String(message).slice(0, 1500) } },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Item in flight*\\n' + excerpt } },\n          {\n            type: 'context',\n            elements: [\n              {\n                type: 'mrkdwn',\n                text: execution.url ? 'Open the execution: ' + execution.url : 'Manual execution - no permalink',\n              },\n            ],\n          },\n        ],\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        300
+      ],
+      "id": "c-0002-4a1b-9c2d-000000000002",
+      "name": "Format Alert",
+      "notes": "Names the workflow, the node, the error, the item that was in flight and the execution link. An alert that says only \"a workflow failed\" costs the person on shift the next ten minutes."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_ALERTS_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack_payload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -120,
+        300
+      ],
+      "id": "h-0003-4a1b-9c2d-000000000003",
+      "name": "Alert Ops Channel",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Both outputs go to the recorder below. Slack being down during an incident is not unusual - it is correlated with everything else being down - and the row has to be written anyway."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Written whether or not Slack accepted the message, with alert_delivered\n-- recording which.\n--\n-- The unique index behind this ON CONFLICT is PARTIAL - unique on execution_id\n-- only where execution_id is not null. An Error Trigger delivery can repeat for\n-- the same production execution and must not create a second row; a manual\n-- execution has no id at all and two of those must both be recorded.\nINSERT INTO failures\n  (workflow_id, workflow_name, execution_id, execution_url, failed_node, error_name,\n   error_message, error_description, error_stack, execution_mode, retry_of,\n   input_excerpt, alert_delivered)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)\nON CONFLICT (execution_id) WHERE execution_id IS NOT NULL DO NOTHING\nRETURNING id, workflow_name, failed_node;",
+        "options": {
+          "queryReplacement": "={{ (() => { const f = $('Format Alert').first().json; return [f.workflow_id, f.workflow_name, f.execution_id, f.execution_url, f.failed_node, f.error_name, f.error_message, f.error_description, f.error_stack, f.execution_mode, f.retry_of, f.input_excerpt, !$json.error]; })() }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        100,
+        300
+      ],
+      "id": "p-0004-4a1b-9c2d-000000000004",
+      "name": "Record Failure",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "Slack is for the person on shift; this table is for the Monday review. You cannot ask Slack history which node failed most often last month."
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Alert Ops Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Ops Channel": {
+      "main": [
+        [
+          {
+            "node": "Record Failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 120
+  },
+  "pinData": {}
+}

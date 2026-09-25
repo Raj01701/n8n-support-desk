@@ -1,0 +1,997 @@
+{
+  "name": "01 - Email Support Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "readStatus": "unread",
+          "includeSpamTrash": false,
+          "includeDrafts": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -1560,
+        300
+      ],
+      "id": "t-0001-4a1b-9c2d-000000000001",
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": null,
+          "name": "Gmail - Support Inbox"
+        }
+      },
+      "notes": "Polls the support mailbox every minute for unread mail. Simplify is OFF on purpose: the simplified output has no body, and the body is the thing the agent has to read. Read status \"unread\" is the cheap half of the dedupe; processed_messages is the half that actually holds."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The four fields the brief names - sender, subject, body, thread id - plus the\n// two message ids, made explicit so they are visible in this node's output\n// rather than buried in the Gmail payload. Nothing downstream reads the raw\n// Gmail item.\n//\n// Two different ids matter and they are not interchangeable:\n//   id         - Gmail's own message id. Stable, unique, assigned by Google.\n//                This is the idempotency key and what the reply node quotes.\n//   messageId  - the RFC 5322 Message-ID header. Written by the SENDER, so a\n//                sender can repeat it or forge it. Kept for the audit trail and\n//                for threading in non-Gmail clients; never used as a key.\nconst MONEY_MARKERS = [\n  'refund', 'refunded', 'chargeback', 'charge back', 'money back', 'reimburse',\n  'double charged', 'charged twice', 'overcharged', 'dispute', 'credit note',\n  'compensation', 'invoice me', 'cancel my subscription and refund',\n];\nconst LEGAL_MARKERS = ['lawyer', 'solicitor', 'legal action', 'gdpr request', 'data deletion request', 'ombudsman', 'small claims'];\nconst ANGRY_MARKERS = ['unacceptable', 'appalling', 'furious', 'disgusted', 'worst', 'scam', 'fraud'];\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const email = item.json;\n\n  // mailparser gives from/to as { value: [{ address, name }], text }.\n  const fromValue = email.from?.value?.[0] ?? {};\n  const sender = String(fromValue.address || email.from?.text || '').trim().toLowerCase();\n  if (!sender) throw new Error('Gmail message ' + email.id + ' has no parseable From address');\n\n  const subject = String(email.subject || '(no subject)').trim();\n\n  // text is the plain-text part. Falling back to stripping the HTML is not\n  // cosmetic: a marketing email is often HTML-only, and an empty body would\n  // classify as \"unclear\" and reach a human instead of being routed out.\n  const body = String(\n    email.text || String(email.html || '').replace(/<[^>]+>/g, ' ') || email.snippet || '',\n  )\n    .replace(/\\r/g, '')\n    .replace(/[ \\t]+/g, ' ')\n    .trim()\n    .slice(0, 8000);\n\n  const haystack = (subject + ' ' + body).toLowerCase();\n  const money = MONEY_MARKERS.filter((m) => haystack.includes(m));\n  const legal = LEGAL_MARKERS.filter((m) => haystack.includes(m));\n  const angry = ANGRY_MARKERS.filter((m) => haystack.includes(m));\n\n  out.push({\n    json: {\n      // --- the four the brief names, plus the ids ---------------------------\n      sender,\n      sender_name: String(fromValue.name || '').trim() || null,\n      subject,\n      body,\n      thread_id: String(email.threadId || ''),\n      gmail_message_id: String(email.id || ''),\n      rfc_message_id: String(email.messageId || '') || null,\n      // --- context ----------------------------------------------------------\n      received_at: email.date || new Date().toISOString(),\n      label_ids: email.labelIds || [],\n      decision_key: 'email:' + String(email.id || ''),\n      // --- deterministic sweep ---------------------------------------------\n      // Computed before the model is asked anything, so it cannot be argued\n      // out of by a confident classification. It can only ADD caution.\n      keyword_money: money.length > 0,\n      keyword_legal: legal.length > 0,\n      keyword_angry: angry.length > 0,\n      keyword_hits: [...money, ...legal, ...angry].slice(0, 8),\n    },\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1340,
+        300
+      ],
+      "id": "c-0002-4a1b-9c2d-000000000002",
+      "name": "Capture Email Fields",
+      "notes": "Sender, subject, body, threadId and both message ids, captured explicitly. The keyword sweep runs here, before the model is consulted, so its result cannot be influenced by the classification."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The idempotency claim. INSERT ... ON CONFLICT DO NOTHING RETURNING, never\n-- \"SELECT then INSERT\": two deliveries of the same message can be in flight at\n-- the same moment, and both would pass a prior SELECT and both would reply.\n--\n-- Exactly one INSERT wins the unique index. The loser gets zero rows back,\n-- which the IF below reads as \"already handled\" and exits on.\nINSERT INTO processed_messages\n  (gmail_message_id, thread_id, rfc_message_id, from_address, subject, received_at)\nVALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (gmail_message_id) DO NOTHING\nRETURNING id, gmail_message_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.gmail_message_id, $json.thread_id, $json.rfc_message_id, $json.sender, $json.subject, $json.received_at ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1120,
+        300
+      ],
+      "id": "p-0003-4a1b-9c2d-000000000003",
+      "name": "Claim This Message",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "alwaysOutputData is required here and nowhere else in this workflow: without it a duplicate produces no items at all, the branch ends silently, and the IF below never runs - so nothing records that a duplicate arrived."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-first-delivery-of-this-message--0",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -900,
+        300
+      ],
+      "id": "i-0004-4a1b-9c2d-000000000004",
+      "name": "First Delivery Of This Message?",
+      "notes": "A row came back: this execution owns the message. No row: another execution already claimed it, and this one stops here with a green execution and no second reply."
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        460
+      ],
+      "id": "n-0005-4a1b-9c2d-000000000005",
+      "name": "Duplicate Delivery - Exit",
+      "notes": "The end of the road for a redelivered message. Green, silent, no reply sent. The proof that it worked is that support_decisions still holds exactly one row for this message id."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The Postgres node above replaced the item with its RETURNING row, so the\n// email is put back. Matched by gmail_message_id rather than by position:\n// when a poll delivers several messages and one of them is a duplicate, the\n// claim node emits fewer rows than it received and positions no longer line up.\nconst captured = new Map($('Capture Email Fields').all().map((i) => [i.json.gmail_message_id, i.json]));\n\nreturn $input\n  .all()\n  .filter((i) => i.json && i.json.gmail_message_id)\n  .map((i) => ({ json: { ...captured.get(i.json.gmail_message_id), claim_id: i.json.id } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        160
+      ],
+      "id": "c-0006-4a1b-9c2d-000000000006",
+      "name": "Restore Email Context"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_API_BASE }}/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $env.LLM_MODEL }}\",\n  \"temperature\": 0,\n  \"max_tokens\": 300,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You triage a business support inbox. Decide whether an incoming email is a genuine support request from a customer, and return JSON only.\\n\\nis_support is true only for a real person asking this business for help with its product, their account, an order, a bug, or how something works.\\n\\nis_support is false for: marketing newsletters and digests, automated receipts and invoices from suppliers, recruiters and job applications, cold sales pitches and link-building or SEO offers, internal team mail (standups, sprint notes, all-hands), calendar and delivery notifications, out-of-office replies, and spam.\\n\\nconfidence is your own calibrated probability that this decision is correct. Be conservative. If the message mixes topics, is ambiguous, is written by an angry customer, or you cannot tell what is being asked, return a confidence below 0.6.\\n\\ntouches_money must be true for anything that could move money or change a contract: refunds, chargebacks, cancellations with money attached, discount requests, price disputes, duplicate charges, invoices the sender wants changed, or anything legal.\\n\\nreason is one short sentence explaining the decision in terms a human reviewing the log would accept.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify('From: ' + $json.sender + '\\nSubject: ' + $json.subject + '\\n\\n' + $json.body.slice(0, 4000)) }}\n    }\n  ],\n  \"response_format\": {\n    \"type\": \"json_schema\",\n    \"json_schema\": {\n      \"name\": \"support_classification\",\n      \"strict\": true,\n      \"schema\": {\n        \"type\": \"object\",\n        \"additionalProperties\": false,\n        \"required\": [\n          \"is_support\",\n          \"intent\",\n          \"confidence\",\n          \"touches_money\",\n          \"reason\"\n        ],\n        \"properties\": {\n          \"is_support\": {\n            \"type\": \"boolean\"\n          },\n          \"intent\": {\n            \"type\": \"string\",\n            \"enum\": [\n              \"product_question\",\n              \"billing_question\",\n              \"billing_dispute\",\n              \"bug_report\",\n              \"account_access\",\n              \"other_support\",\n              \"newsletter\",\n              \"invoice_or_receipt\",\n              \"recruiting\",\n              \"sales_pitch\",\n              \"internal\",\n              \"spam\",\n              \"other_non_support\"\n            ]\n          },\n          \"confidence\": {\n            \"type\": \"number\",\n            \"minimum\": 0,\n            \"maximum\": 1\n          },\n          \"touches_money\": {\n            \"type\": \"boolean\"\n          },\n          \"reason\": {\n            \"type\": \"string\"\n          }\n        }\n      }\n    }\n  }\n}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -460,
+        160
+      ],
+      "id": "h-0007-4a1b-9c2d-000000000007",
+      "name": "Classify: Support Or Not",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": null,
+          "name": "LLM API Key"
+        }
+      },
+      "notes": "OpenAI-compatible chat completion with response_format json_schema, strict: true. Any provider that speaks the same shape (OpenAI, Azure OpenAI, Groq, a local vLLM) is a change of LLM_API_BASE, not a change of workflow."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Three attempts, all failed. The safe default when triage is impossible is to\n// treat the mail as support that needs a person: an unanswered customer is\n// recoverable, an auto-reply built on a guess is not. touches_money is forced\n// true so the gate downstream cannot auto-answer it whatever the engine says.\nconst email = $('Restore Email Context').first().json;\nconst failure = $input.first().json?.error ?? {};\n\nreturn [\n  {\n    json: {\n      ...email,\n      is_support: true,\n      intent: 'other_support',\n      classifier_confidence: 0,\n      touches_money: true,\n      caution_reason: 'classifier unavailable - defaulted to human review',\n      classification_reason: 'the classifier could not be reached',\n      integration_error: 'Classify: Support Or Not - ' + String(failure.message || failure.description || 'unavailable').slice(0, 300),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        420
+      ],
+      "id": "c-0008-4a1b-9c2d-000000000008",
+      "name": "Classifier Unavailable",
+      "notes": "Fails safe towards a human, not towards an answer. The error output of an LLM call is the one place where a workflow gets to decide what \"we do not know\" means, and here it means \"a person reads this\"."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The model classifies; the keyword sweep audits it, in one direction only.\n//\n// A sweep that could LOWER caution would be a way to talk the gate into\n// answering a refund request by phrasing it carefully. So every rule here can\n// set touches_money to true or pull confidence down, and none of them can do\n// the opposite. If the model says \"no money involved\" and the customer wrote\n// the word \"chargeback\", the customer wins.\nconst email = $('Restore Email Context').first().json;\nconst raw = $input.first().json;\n\nconst content = raw?.choices?.[0]?.message?.content;\nif (typeof content !== 'string') {\n  throw new Error(\n    'The classifier endpoint did not return a chat completion. Body began: ' +\n      JSON.stringify(raw).slice(0, 300),\n  );\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(content);\n} catch (err) {\n  throw new Error('The classifier returned content that is not JSON: ' + content.slice(0, 300));\n}\n\nconst cautions = [];\nlet confidence = Number(parsed.confidence);\nif (!Number.isFinite(confidence)) confidence = 0;\n\nif (email.keyword_money) cautions.push('money keywords: ' + email.keyword_hits.join(', '));\nif (email.keyword_legal) cautions.push('legal keywords');\nif (email.keyword_angry) cautions.push('angry language');\n\n// An angry customer is still a support request, but not one a bot should take\n// the first swing at. Capping rather than zeroing keeps the number honest in\n// the decision log.\nif (email.keyword_angry) confidence = Math.min(confidence, 0.5);\n\nreturn [\n  {\n    json: {\n      ...email,\n      is_support: parsed.is_support === true,\n      intent: String(parsed.intent || 'other_support'),\n      classifier_confidence: Math.round(confidence * 1000) / 1000,\n      touches_money: parsed.touches_money === true || email.keyword_money || email.keyword_legal,\n      classification_reason: String(parsed.reason || '').slice(0, 400),\n      caution_reason: cautions.join('; ') || null,\n      integration_error: null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        160
+      ],
+      "id": "c-0009-4a1b-9c2d-000000000009",
+      "name": "Apply Keyword Sweep",
+      "notes": "Deterministic guard on a probabilistic decision. It can only add caution: touches_money is OR-ed, confidence is capped, and there is no path through this node that makes the model look safer than it said it was."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-is-this-a-support-request--0",
+              "leftValue": "={{ $json.is_support }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        160
+      ],
+      "id": "i-0010-4a1b-9c2d-000000000010",
+      "name": "Is This A Support Request?",
+      "notes": "The fork the brief asks for. False does not mean \"delete\": it means labelled, logged and left in the mailbox where a human can find it."
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.gmail_message_id }}",
+        "labelIds": "={{ [$env.GMAIL_NOT_SUPPORT_LABEL_ID] }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        200,
+        420
+      ],
+      "id": "g-0011-4a1b-9c2d-000000000011",
+      "name": "Label As Not Support",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": null,
+          "name": "Gmail - Support Inbox"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Routed OUT, not dropped. The mail stays in the mailbox under Support/Not-Support, so the decision is visible to a human and reversible by one drag. Both outputs go to the same node: a labelling failure must not lose the decision row."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reached from both outputs of the label node, so the row is written whether or\n// not Gmail accepted the label. A decision log missing exactly the decisions\n// that went wrong is worse than no decision log.\nconst email = $('Apply Keyword Sweep').first().json;\nconst arrived = $input.first().json ?? {};\nconst labelFailed = Boolean(arrived.error);\n\nreturn [\n  {\n    json: {\n      decision_key: email.decision_key,\n      channel: 'email',\n      from_address: email.sender,\n      subject: email.subject,\n      conversation_ref: email.thread_id,\n      intent: email.intent,\n      is_support: false,\n      confidence: email.classifier_confidence,\n      grounded: false,\n      touches_money: email.touches_money,\n      action: 'routed_out_not_support',\n      inbound_text: email.body,\n      reply_text: null,\n      used_article_ids: [],\n      reason: email.classification_reason,\n      integration_error: labelFailed\n        ? 'Label As Not Support - ' + String(arrived.error?.message || 'failed').slice(0, 300)\n        : null,\n      execution_id: String($execution.id),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        420
+      ],
+      "id": "c-0012-4a1b-9c2d-000000000012",
+      "name": "Build Decision (Routed Out)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Thread continuity. Everything the desk has already decided on this Gmail\n-- thread, oldest first, so a follow-up is answered in the light of the first\n-- reply instead of from scratch.\n--\n-- Ordered ascending and limited from the end with a subquery, because \"the last\n-- N turns, oldest first\" is two different orderings and getting it backwards\n-- hands the model the conversation in reverse.\nSELECT * FROM (\n  SELECT created_at, action, reason, inbound_text, reply_text, grounded\n    FROM support_decisions\n   WHERE conversation_ref = $1\n     AND channel = 'email'\n   ORDER BY created_at DESC\n   LIMIT $2::int\n) AS recent\nORDER BY created_at ASC;",
+        "options": {
+          "queryReplacement": "={{ [ $json.thread_id, Number($env.EMAIL_HISTORY_TURNS) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        60
+      ],
+      "id": "p-0013-4a1b-9c2d-000000000013",
+      "name": "Load Thread History",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "alwaysOutputData so the first message in a thread - which has no history at all - still produces an item for the node below."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The call into the shared backend. Both channels build this same shape, which\n// is the point: there is one place that knows how to answer a question, and two\n// places that know how to receive one.\nconst email = $('Apply Keyword Sweep').first().json;\n\n// Both sides of the conversation, in order. The customer's own earlier words\n// are what make a follow-up retrievable; the agent's earlier answers are what\n// stop it repeating itself.\nconst history = $input\n  .all()\n  .map((i) => i.json)\n  .filter((row) => row && row.created_at)\n  .flatMap((row) => [\n    ...(row.inbound_text ? [{ role: 'visitor', content: row.inbound_text }] : []),\n    ...(row.reply_text ? [{ role: 'agent', content: row.reply_text }] : []),\n  ]);\n\nreturn [\n  {\n    json: {\n      ...email,\n      channel: 'email',\n      text: email.body,\n      session_or_thread_id: email.thread_id,\n      history,\n      history_turns: history.length,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        60
+      ],
+      "id": "c-0014-4a1b-9c2d-000000000014",
+      "name": "Build Engine Request"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_ANSWER_ENGINE_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        60
+      ],
+      "id": "x-0015-4a1b-9c2d-000000000015",
+      "name": "Ask The Answer Engine",
+      "notes": "Workflow 03, called as a sub-workflow - literally the same workflow the chat widget calls, not a second copy of the same logic. Ships with a placeholder id; scripts/configure-n8n.mjs fills in the real one, the same way it fills in the error workflow."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The engine returns what it knows about the ANSWER. The classification knows\n// what the message is. The gate below needs both, in one item.\nconst context = $('Build Engine Request').first().json;\nconst result = $input.first().json ?? {};\n\nreturn [\n  {\n    json: {\n      ...context,\n      grounded: result.grounded === true,\n      answer: result.answer ?? null,\n      // Two independent confidences, and the gate must clear the lower of them.\n      // A confident classification of a question the knowledge base half-answers\n      // is not a confident answer.\n      answer_confidence: Number(result.confidence ?? 0),\n      confidence: Math.min(Number(context.classifier_confidence ?? 0), Number(result.confidence ?? 0)),\n      used_article_ids: result.used_article_ids ?? [],\n      escalate_reason: result.escalate_reason ?? null,\n      times_asked: result.times_asked ?? null,\n      integration_error: context.integration_error || result.integration_error || null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        60
+      ],
+      "id": "c-0016-4a1b-9c2d-000000000016",
+      "name": "Combine Answer And Classification",
+      "notes": "Takes the MINIMUM of the two confidences. Multiplying them would punish two good scores; taking the minimum means the weakest link decides, which is what a gate is for."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-confidence-gate-0",
+              "leftValue": "={{ $json.grounded }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "cond-confidence-gate-1",
+              "leftValue": "={{ $json.answer }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "cond-confidence-gate-2",
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": "={{ Number($env.SUPPORT_CONFIDENCE_THRESHOLD) }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "cond-confidence-gate-3",
+              "leftValue": "={{ $json.touches_money }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1080,
+        60
+      ],
+      "id": "i-0017-4a1b-9c2d-000000000017",
+      "name": "Confidence Gate",
+      "notes": "Four conditions, all required, combined with AND: the engine found a grounded answer, the answer is not empty, the weaker of the two confidences clears the threshold, and the message does not touch money or legal matters. Anything else is a handover. The threshold is an env var so it can be tightened in production without touching the workflow."
+    },
+    {
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{ $json.gmail_message_id }}",
+        "message": "={{ 'Hi' + ($json.sender_name ? ' ' + $json.sender_name.split(' ')[0] : '') + ',\\n\\n' + $json.answer + '\\n\\nIf that does not cover it, just reply here and one of us will pick it up.\\n\\n' + $env.BUSINESS_NAME + ' Support' }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "={{ $env.BUSINESS_NAME }} Support"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        -60
+      ],
+      "id": "g-0018-4a1b-9c2d-000000000018",
+      "name": "Reply In The Same Thread",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": null,
+          "name": "Gmail - Support Inbox"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "The reply operation reads the original message's Message-ID and sets In-Reply-To and References from it, then sends with the original threadId. Both halves matter: threadId is what groups it in the Gmail web UI, and the two headers are what group it in Outlook, Apple Mail and every other client that has never heard of a Gmail thread id."
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $('Combine Answer And Classification').first().json.gmail_message_id }}",
+        "labelIds": "={{ [$env.GMAIL_AUTO_REPLIED_LABEL_ID] }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1520,
+        -60
+      ],
+      "id": "g-0019-4a1b-9c2d-000000000019",
+      "name": "Label As Auto Replied",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": null,
+          "name": "Gmail - Support Inbox"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "So a human scanning the mailbox can see at a glance what the agent answered, without opening anything."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const context = $('Combine Answer And Classification').first().json;\nconst sent = $('Reply In The Same Thread').first().json ?? {};\nconst arrived = $input.first().json ?? {};\nconst labelFailed = Boolean(arrived.error);\n\nreturn [\n  {\n    json: {\n      decision_key: context.decision_key,\n      channel: 'email',\n      from_address: context.sender,\n      subject: context.subject,\n      conversation_ref: context.thread_id,\n      intent: context.intent,\n      is_support: true,\n      confidence: context.confidence,\n      grounded: true,\n      touches_money: context.touches_money,\n      action: 'auto_replied',\n      inbound_text: context.body,\n      reply_text: context.answer,\n      used_article_ids: context.used_article_ids,\n      reason: 'answered from articles ' + (context.used_article_ids || []).join(', '),\n      integration_error: labelFailed\n        ? 'Label As Auto Replied - ' + String(arrived.error?.message || 'failed').slice(0, 300)\n        : null,\n      execution_id: String($execution.id),\n      sent_thread_id: sent.threadId ?? null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        -60
+      ],
+      "id": "c-0020-4a1b-9c2d-000000000020",
+      "name": "Build Decision (Auto Replied)"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Gmail refused the reply three times. The answer was good; the delivery was\n// not. That is a handover, not a retry loop, and the customer is now waiting.\nconst context = $('Combine Answer And Classification').first().json;\nconst failure = $input.first().json?.error ?? {};\n\nreturn [\n  {\n    json: {\n      ...context,\n      escalate_reason: 'reply_delivery_failed',\n      handover_reason: 'The agent had an answer but Gmail rejected the reply three times.',\n      integration_error: 'Reply In The Same Thread - ' + String(failure.message || failure.description || 'failed').slice(0, 300),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        320
+      ],
+      "id": "c-0021-4a1b-9c2d-000000000021",
+      "name": "Handover: Reply Failed"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Every route to a human passes through here, so the reason a customer did not\n// get an automated answer is written once and is always in the same words.\nconst context = $input.first().json;\n\nconst reasons = {\n  no_matching_article: 'The knowledge base has no article covering this question.',\n  not_answerable_from_kb: 'Articles were found but none of them answer this question.',\n  answer_engine_unavailable: 'The answer engine could not be reached.',\n  reply_delivery_failed: 'The agent had an answer but Gmail rejected the reply.',\n};\n\nlet reason;\nif (context.touches_money) {\n  reason = 'Touches money or legal matters - never auto-answered, whatever the confidence.';\n} else if (context.handover_reason) {\n  reason = context.handover_reason;\n} else if (context.escalate_reason && reasons[context.escalate_reason]) {\n  reason = reasons[context.escalate_reason];\n} else if (!context.grounded) {\n  reason = 'No grounded answer was produced.';\n} else {\n  reason = 'Confidence ' + context.confidence + ' is below the threshold ' + ($env.SUPPORT_CONFIDENCE_THRESHOLD || '?') + '.';\n}\n\nreturn [\n  {\n    json: {\n      ...context,\n      handover_reason: reason,\n      slack_payload: {\n        text: 'Support email needs a human: ' + context.subject,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: 'Support email needs a human' } },\n          {\n            type: 'section',\n            fields: [\n              { type: 'mrkdwn', text: '*From*\\n' + context.sender },\n              { type: 'mrkdwn', text: '*Subject*\\n' + String(context.subject).slice(0, 140) },\n              { type: 'mrkdwn', text: '*Confidence*\\n' + context.confidence },\n              { type: 'mrkdwn', text: '*Touches money*\\n' + (context.touches_money ? 'yes' : 'no') },\n            ],\n          },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Why a human*\\n' + reason } },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Question*\\n' + String(context.body || '').slice(0, 900) } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Gmail thread ' + context.thread_id + ' - labelled Support/Needs-Human' }] },\n        ],\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        320
+      ],
+      "id": "c-0022-4a1b-9c2d-000000000022",
+      "name": "Build Handover"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $('Build Handover').first().json.gmail_message_id }}",
+        "labelIds": "={{ [$env.GMAIL_NEEDS_HUMAN_LABEL_ID] }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        480
+      ],
+      "id": "g-0023-4a1b-9c2d-000000000023",
+      "name": "Label As Needs Human",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": null,
+          "name": "Gmail - Support Inbox"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "The signal a human actually sees. Both outputs continue to the queue: a failed label must not stop the ticket being opened."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Unique on decision_key for the same reason processed_messages is: a replayed\n-- execution must not open a second ticket for one customer email. A duplicate\n-- ticket is how an agent looks broken to the humans behind it.\nINSERT INTO human_review_queue\n  (decision_key, channel, conversation_ref, from_address, subject, question, reason, confidence, suggested_answer)\nVALUES ($1, 'email', $2, $3, $4, $5, $6, $7, $8)\nON CONFLICT (decision_key) DO NOTHING\nRETURNING id, created_at;",
+        "options": {
+          "queryReplacement": "={{ (() => { const c = $('Build Handover').first().json; return [c.decision_key, c.thread_id, c.sender, c.subject, c.body, c.handover_reason, c.confidence, c.answer]; })() }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1520,
+        480
+      ],
+      "id": "p-0024-4a1b-9c2d-000000000024",
+      "name": "Queue For A Human",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "alwaysOutputData: a replayed execution finds the ticket already open, gets zero rows back, and must still continue to the alert and the decision row rather than ending the branch here."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_HUMAN_REVIEW_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Handover').first().json.slack_payload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1740,
+        480
+      ],
+      "id": "h-0025-4a1b-9c2d-000000000025",
+      "name": "Alert The Review Channel",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Both outputs go to the decision row below, which records whether Slack accepted. A queue entry that exists and an alert that never arrived is a very different incident from neither happening, and the log has to be able to tell them apart."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const context = $('Build Handover').first().json;\nconst arrived = $input.first().json ?? {};\nconst slackFailed = Boolean(arrived.error);\n\nreturn [\n  {\n    json: {\n      decision_key: context.decision_key,\n      channel: 'email',\n      from_address: context.sender,\n      subject: context.subject,\n      conversation_ref: context.thread_id,\n      intent: context.intent,\n      is_support: true,\n      confidence: context.confidence,\n      grounded: context.grounded === true,\n      touches_money: context.touches_money,\n      action: 'handed_to_human',\n      inbound_text: context.body,\n      reply_text: null,\n      used_article_ids: context.used_article_ids || [],\n      reason: context.handover_reason,\n      integration_error: [\n        context.integration_error,\n        slackFailed ? 'Alert The Review Channel - ' + String(arrived.error?.message || 'failed').slice(0, 200) : null,\n      ].filter(Boolean).join(' | ') || null,\n      execution_id: String($execution.id),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        480
+      ],
+      "id": "c-0026-4a1b-9c2d-000000000026",
+      "name": "Build Decision (Handed To Human)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Every decision, every branch, one row. This is what you read when the client\n-- asks \"why did the bot say that\", and what you group by to decide whether\n-- SUPPORT_CONFIDENCE_THRESHOLD can come down.\n--\n-- DO UPDATE rather than DO NOTHING: a manually re-run execution should correct\n-- the row it already wrote, not leave a stale one next to a new one.\nINSERT INTO support_decisions\n  (decision_key, channel, from_address, subject, conversation_ref, intent, is_support,\n   confidence, grounded, touches_money, action, inbound_text, reply_text,\n   used_article_ids, reason, integration_error, execution_id)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint[], $15, $16, $17)\nON CONFLICT (decision_key) DO UPDATE\n   SET action            = excluded.action,\n       confidence        = excluded.confidence,\n       grounded          = excluded.grounded,\n       reply_text        = excluded.reply_text,\n       used_article_ids  = excluded.used_article_ids,\n       reason            = excluded.reason,\n       integration_error = excluded.integration_error,\n       execution_id      = excluded.execution_id\nRETURNING id, action, created_at;",
+        "options": {
+          "queryReplacement": "={{ [ $json.decision_key, $json.channel, $json.from_address, $json.subject, $json.conversation_ref, $json.intent, $json.is_support, $json.confidence, $json.grounded, $json.touches_money, $json.action, $json.inbound_text, $json.reply_text, \"{\" + ($json.used_article_ids || []).join(\",\") + \"}\", $json.reason, $json.integration_error, $json.execution_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2180,
+        220
+      ],
+      "id": "p-0027-4a1b-9c2d-000000000027",
+      "name": "Log Decision",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "The last node on all three branches. A Postgres failure here fails the execution on purpose - a decision that was acted on but never recorded is the one thing this desk must not do quietly."
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Capture Email Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Email Fields": {
+      "main": [
+        [
+          {
+            "node": "Claim This Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim This Message": {
+      "main": [
+        [
+          {
+            "node": "First Delivery Of This Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "First Delivery Of This Message?": {
+      "main": [
+        [
+          {
+            "node": "Restore Email Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Duplicate Delivery - Exit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Email Context": {
+      "main": [
+        [
+          {
+            "node": "Classify: Support Or Not",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify: Support Or Not": {
+      "main": [
+        [
+          {
+            "node": "Apply Keyword Sweep",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classifier Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Keyword Sweep": {
+      "main": [
+        [
+          {
+            "node": "Is This A Support Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classifier Unavailable": {
+      "main": [
+        [
+          {
+            "node": "Build Handover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is This A Support Request?": {
+      "main": [
+        [
+          {
+            "node": "Load Thread History",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Label As Not Support",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Label As Not Support": {
+      "main": [
+        [
+          {
+            "node": "Build Decision (Routed Out)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Decision (Routed Out)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Decision (Routed Out)": {
+      "main": [
+        [
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Thread History": {
+      "main": [
+        [
+          {
+            "node": "Build Engine Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Engine Request": {
+      "main": [
+        [
+          {
+            "node": "Ask The Answer Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask The Answer Engine": {
+      "main": [
+        [
+          {
+            "node": "Combine Answer And Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Answer And Classification": {
+      "main": [
+        [
+          {
+            "node": "Confidence Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Gate": {
+      "main": [
+        [
+          {
+            "node": "Reply In The Same Thread",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Handover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply In The Same Thread": {
+      "main": [
+        [
+          {
+            "node": "Label As Auto Replied",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handover: Reply Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Label As Auto Replied": {
+      "main": [
+        [
+          {
+            "node": "Build Decision (Auto Replied)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Decision (Auto Replied)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Decision (Auto Replied)": {
+      "main": [
+        [
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handover: Reply Failed": {
+      "main": [
+        [
+          {
+            "node": "Build Handover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Handover": {
+      "main": [
+        [
+          {
+            "node": "Label As Needs Human",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Label As Needs Human": {
+      "main": [
+        [
+          {
+            "node": "Queue For A Human",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queue For A Human",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Queue For A Human": {
+      "main": [
+        [
+          {
+            "node": "Alert The Review Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert The Review Channel": {
+      "main": [
+        [
+          {
+            "node": "Build Decision (Handed To Human)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Decision (Handed To Human)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Decision (Handed To Human)": {
+      "main": [
+        [
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_WITH_WORKFLOW_04_ID",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 300
+  },
+  "pinData": {}
+}

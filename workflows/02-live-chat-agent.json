@@ -1,0 +1,686 @@
+{
+  "name": "02 - Live Chat Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "chat/message",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1340,
+        300
+      ],
+      "id": "w-0001-4a1b-9c2d-000000000001",
+      "name": "Chat Webhook",
+      "webhookId": "b2000002-0001-4a1b-9c2d-chatwidgetinbound",
+      "notes": "POST /webhook/chat/message. responseMode is \"responseNode\", not \"onReceived\": the visitor gets the actual answer in the body of this same request, which is what \"replies immediately\" has to mean for a chat widget. allowedOrigins is * for the demo; set it to the client's own domain in production - docs/setup.md says how and why."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// A chat widget cannot hold a real credential: everything it knows is in the\n// page source. So this secret stops casual drive-by posting and nothing more,\n// and the honest mitigation is rate limiting at the proxy plus the fact that\n// the agent can only ever read from a public knowledge base. That is written\n// down in docs/setup.md rather than implied by the presence of a check.\n//\n// Compared in constant time anyway. A timing oracle on a weak secret is still a\n// timing oracle, and timingSafeEqual costs nothing.\nconst crypto = require('crypto');\n\nconst secret = $env.CHAT_WEBHOOK_SECRET;\nif (!secret) throw new Error('CHAT_WEBHOOK_SECRET is not set on this n8n instance');\n\nconst MONEY_MARKERS = [\n  'refund', 'refunded', 'chargeback', 'charge back', 'money back', 'reimburse',\n  'double charged', 'charged twice', 'overcharged', 'dispute', 'credit note',\n  'compensation', 'cancel and refund',\n];\nconst LEGAL_MARKERS = ['lawyer', 'solicitor', 'legal action', 'gdpr request', 'ombudsman'];\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const headers = item.json.headers || {};\n  const presented = String(headers['x-chat-secret'] || '');\n\n  const a = Buffer.from(presented.padEnd(secret.length, '\\0').slice(0, secret.length), 'utf8');\n  const b = Buffer.from(secret, 'utf8');\n  if (presented.length !== secret.length || !crypto.timingSafeEqual(a, b)) {\n    throw new Error('Chat webhook rejected: bad or missing x-chat-secret');\n  }\n\n  const body = item.json.body || {};\n\n  // The session id comes from the visitor's localStorage, so it is\n  // attacker-controlled. It is only ever a key - never identity, never\n  // interpolated into SQL - and the shape is checked so it cannot be used to\n  // fill the table with one enormous row.\n  const sessionId = String(body.session_id || '').trim();\n  if (!/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) {\n    throw new Error('Chat webhook rejected: session_id must be 8-128 characters of [A-Za-z0-9_-]');\n  }\n\n  const message = String(body.message || '').trim().slice(0, 4000);\n  if (!message) throw new Error('Chat webhook rejected: empty message');\n\n  const haystack = message.toLowerCase();\n  const money = MONEY_MARKERS.filter((m) => haystack.includes(m));\n  const legal = LEGAL_MARKERS.filter((m) => haystack.includes(m));\n\n  const visitorEmail = String(body.visitor_email || '').trim().toLowerCase() || null;\n\n  out.push({\n    json: {\n      session_id: sessionId,\n      message,\n      page_url: String(body.page_url || '').slice(0, 500) || null,\n      visitor_email: visitorEmail && /.+@.+\\..+/.test(visitorEmail) ? visitorEmail : null,\n      // Chat has no upstream message id, so the key is the session plus a hash\n      // of what was said. A visitor who sends the same sentence twice in one\n      // session is genuinely the same decision; two visitors never collide.\n      decision_key:\n        'chat:' + sessionId + ':' + crypto.createHash('sha256').update(message).digest('hex').slice(0, 16),\n      // The same deterministic sweep workflow 01 runs. Chat does not classify\n      // support-vs-not - a visitor who opened the widget is asking for help by\n      // definition - but the money rule applies identically on both channels.\n      touches_money: money.length > 0 || legal.length > 0,\n      keyword_hits: [...money, ...legal].slice(0, 8),\n      received_at: new Date().toISOString(),\n    },\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1120,
+        300
+      ],
+      "id": "c-0002-4a1b-9c2d-000000000002",
+      "name": "Verify Shared Secret",
+      "notes": "Authenticates, validates and normalises before anything is written or spent. The money sweep is the same list as workflow 01, deliberately: the gate must behave identically whichever door the question came through."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One row per widget session. ON CONFLICT DO UPDATE rather than a prior SELECT,\n-- because a visitor who types two messages quickly can have two executions in\n-- flight and both would find no session and both would insert.\n--\n-- visitor_email uses coalesce(excluded, existing): a visitor who gives their\n-- address on message four must not have it erased by message five, which sends\n-- nothing.\nINSERT INTO chat_sessions (session_id, visitor_email, first_page_url)\nVALUES ($1, $2, $3)\nON CONFLICT (session_id) DO UPDATE\n   SET last_seen_at  = now(),\n       visitor_email = coalesce(excluded.visitor_email, chat_sessions.visitor_email)\nRETURNING session_id, started_at;",
+        "options": {
+          "queryReplacement": "={{ [ $json.session_id, $json.visitor_email, $json.page_url ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -900,
+        300
+      ],
+      "id": "p-0003-4a1b-9c2d-000000000003",
+      "name": "Open Or Touch Session",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The memory. Without this every message is the visitor's first, and the agent\n-- answers \"what about annual?\" as if it had never heard of a plan.\n--\n-- Ordered DESC in the subquery to take the LAST n, then ASC on the way out so\n-- the model reads the conversation forwards.\nSELECT * FROM (\n  SELECT role, content, created_at\n    FROM chat_messages\n   WHERE session_id = $1\n   ORDER BY created_at DESC, id DESC\n   LIMIT $2::int\n) AS recent\nORDER BY created_at ASC;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Shared Secret').first().json.session_id, Number($env.CHAT_HISTORY_TURNS) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -680,
+        300
+      ],
+      "id": "p-0004-4a1b-9c2d-000000000004",
+      "name": "Load Recent Turns",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "alwaysOutputData so the first message of a session - which has no history - still emits an item."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Same shape workflow 01 builds. The two channels differ in how they receive a\n// question and how they deliver an answer; they do not differ in how the answer\n// is produced.\nconst chat = $('Verify Shared Secret').first().json;\n\nconst history = $input\n  .all()\n  .map((i) => i.json)\n  .filter((row) => row && row.content)\n  .map((row) => ({ role: row.role, content: row.content }));\n\nreturn [\n  {\n    json: {\n      ...chat,\n      channel: 'chat',\n      text: chat.message,\n      session_or_thread_id: chat.session_id,\n      history,\n      history_turns: history.length,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        300
+      ],
+      "id": "c-0005-4a1b-9c2d-000000000005",
+      "name": "Build Engine Request"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_ANSWER_ENGINE_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        300
+      ],
+      "id": "x-0006-4a1b-9c2d-000000000006",
+      "name": "Ask The Answer Engine",
+      "notes": "The same workflow 03 the Gmail agent calls - the same n8n workflow id, not a copy. That is what \"connected to the same backend\" means here: add an article, change the prompt or move the relevance floor once and both channels change together."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const context = $('Build Engine Request').first().json;\nconst result = $input.first().json ?? {};\n\nreturn [\n  {\n    json: {\n      ...context,\n      grounded: result.grounded === true,\n      answer: result.answer ?? null,\n      confidence: Number(result.confidence ?? 0),\n      used_article_ids: result.used_article_ids ?? [],\n      escalate_reason: result.escalate_reason ?? null,\n      integration_error: result.integration_error ?? null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        300
+      ],
+      "id": "c-0007-4a1b-9c2d-000000000007",
+      "name": "Combine Answer And Session"
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-confidence-gate-0",
+              "leftValue": "={{ $json.grounded }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "cond-confidence-gate-1",
+              "leftValue": "={{ $json.answer }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "cond-confidence-gate-2",
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": "={{ Number($env.SUPPORT_CONFIDENCE_THRESHOLD) }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "cond-confidence-gate-3",
+              "leftValue": "={{ $json.touches_money }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        300
+      ],
+      "id": "i-0008-4a1b-9c2d-000000000008",
+      "name": "Confidence Gate",
+      "notes": "The same four conditions as workflow 01, reading the same env var. A refund question typed into the chat widget gets a human for exactly the same reason one sent by email does."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const c = $input.first().json;\nreturn [\n  {\n    json: {\n      ...c,\n      action: 'auto_replied',\n      reply_text: c.answer,\n      needs_human: false,\n      handover_reason: null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        180
+      ],
+      "id": "c-0009-4a1b-9c2d-000000000009",
+      "name": "Compose Reply"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// What the visitor is told when the desk cannot answer. It says so plainly and\n// offers a person - it does not improvise, apologise at length, or pretend the\n// question was unclear when the truth is that nobody has written the article.\nconst c = $input.first().json;\n\nlet line;\nif (c.touches_money) {\n  line = 'That one involves money on your account, so I am not going to guess at it. I have passed it to the support team and someone will come back to you here shortly.';\n} else if (c.escalate_reason === 'answer_engine_unavailable') {\n  line = 'Sorry - I cannot reach our help centre at the moment. I have passed your question to the support team and someone will reply shortly.';\n} else {\n  line = 'I could not find that in our help centre, and I would rather say so than guess. I have passed your question to the support team and someone will get back to you.';\n}\n\nif (c.visitor_email) {\n  line += ' We will reply to ' + c.visitor_email + ' as well.';\n} else {\n  line += ' If you leave an email address I can make sure the reply reaches you.';\n}\n\nreturn [\n  {\n    json: {\n      ...c,\n      action: 'handed_to_human',\n      reply_text: line,\n      needs_human: true,\n      handover_reason:\n        c.touches_money\n          ? 'Touches money or legal matters - never auto-answered, whatever the confidence.'\n          : c.escalate_reason === 'no_matching_article'\n            ? 'The knowledge base has no article covering this question.'\n            : c.escalate_reason === 'not_answerable_from_kb'\n              ? 'Articles were found but none of them answer this question.'\n              : c.escalate_reason === 'answer_engine_unavailable'\n                ? 'The answer engine could not be reached.'\n                : 'Confidence ' + c.confidence + ' is below the threshold ' + ($env.SUPPORT_CONFIDENCE_THRESHOLD || '?') + '.',\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        420
+      ],
+      "id": "c-0010-4a1b-9c2d-000000000010",
+      "name": "Compose Handover Reply",
+      "notes": "Says \"I do not know\" in one sentence and hands over. Every extra sentence a bot writes when it has nothing to say is a sentence the customer has to read before they find out they are still stuck."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One named upstream for both branches, so the four nodes below are written\n// once rather than twice.\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "id": "c-0011-4a1b-9c2d-000000000011",
+      "name": "Reply Ready"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ session_id: $json.session_id, reply: $json.reply_text, grounded: $json.grounded, handed_to_human: $json.needs_human, used_article_ids: $json.used_article_ids, answered_at: new Date().toISOString() }) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "access-control-allow-origin",
+                "value": "*"
+              },
+              {
+                "name": "cache-control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        860,
+        300
+      ],
+      "id": "r-0012-4a1b-9c2d-000000000012",
+      "name": "Respond To Visitor",
+      "notes": "The visitor gets their answer here, in the response to their own POST - no polling, no second connection, no \"we will email you\". Everything after this node is bookkeeping, and it runs after the browser already has the reply."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The same table workflow 01 writes to, with channel = 'chat'. One log for the\n-- whole desk means one query answers \"what did support do today\", whichever\n-- door the question came through.\nINSERT INTO support_decisions\n  (decision_key, channel, from_address, subject, conversation_ref, intent, is_support,\n   confidence, grounded, touches_money, action, inbound_text, reply_text,\n   used_article_ids, reason, integration_error, execution_id)\nVALUES ($1, 'chat', $2, $3, $4, 'chat_message', true, $5, $6, $7, $8, $9, $10, $11::bigint[], $12, $13, $14)\nON CONFLICT (decision_key) DO UPDATE\n   SET action            = excluded.action,\n       confidence        = excluded.confidence,\n       grounded          = excluded.grounded,\n       reply_text        = excluded.reply_text,\n       used_article_ids  = excluded.used_article_ids,\n       reason            = excluded.reason,\n       integration_error = excluded.integration_error,\n       execution_id      = excluded.execution_id\nRETURNING id, action;",
+        "options": {
+          "queryReplacement": "={{ (() => { const c = $('Reply Ready').first().json; return [c.decision_key, c.visitor_email, (c.message || \"\").slice(0, 120), c.session_id, c.confidence, c.grounded, c.touches_money, c.action, c.message, c.reply_text, \"{\" + (c.used_article_ids || []).join(\",\") + \"}\", c.handover_reason || \"answered from articles \" + (c.used_article_ids || []).join(\", \"), c.integration_error, String($execution.id)]; })() }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1080,
+        300
+      ],
+      "id": "p-0013-4a1b-9c2d-000000000013",
+      "name": "Log Decision",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The visitor's message and the agent's reply, in that order, in one\n-- statement. Two separate INSERTs would leave a window where a crash records\n-- the question and not the answer, and the next message in the session would\n-- then be answered against a transcript that lies.\nINSERT INTO chat_messages (session_id, role, content, grounded)\nVALUES ($1, 'visitor', $2, NULL),\n       ($1, 'agent',   $3, $4)\nRETURNING id, role;",
+        "options": {
+          "queryReplacement": "={{ (() => { const c = $('Reply Ready').first().json; return [c.session_id, c.message, c.reply_text, c.grounded]; })() }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1300,
+        300
+      ],
+      "id": "p-0014-4a1b-9c2d-000000000014",
+      "name": "Persist Both Turns",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "This is what makes the next message in the session answerable in the light of this one. Written after the response has already gone out, so the visitor never waits on it."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-needs-a-human--0",
+              "leftValue": "={{ $('Reply Ready').first().json.needs_human }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1520,
+        300
+      ],
+      "id": "i-0015-4a1b-9c2d-000000000015",
+      "name": "Needs A Human?",
+      "notes": "Runs after the visitor has their reply. Queueing and alerting are not on the visitor's critical path and should never be."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO human_review_queue\n  (decision_key, channel, conversation_ref, from_address, subject, question, reason, confidence, suggested_answer)\nVALUES ($1, 'chat', $2, $3, $4, $5, $6, $7, $8)\nON CONFLICT (decision_key) DO NOTHING\nRETURNING id, created_at;",
+        "options": {
+          "queryReplacement": "={{ (() => { const c = $('Reply Ready').first().json; return [c.decision_key, c.session_id, c.visitor_email, 'Live chat - ' + (c.page_url || 'unknown page'), c.message, c.handover_reason, c.confidence, c.answer]; })() }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1740,
+        200
+      ],
+      "id": "p-0016-4a1b-9c2d-000000000016",
+      "name": "Queue For A Human",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "Unique on decision_key: a visitor who impatiently sends the same sentence twice opens one ticket, not two."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_HUMAN_REVIEW_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify((() => { const c = $('Reply Ready').first().json; return { text: 'Live chat needs a human', blocks: [ { type: 'header', text: { type: 'plain_text', text: 'Live chat needs a human' } }, { type: 'section', fields: [ { type: 'mrkdwn', text: '*Session*\\n' + c.session_id }, { type: 'mrkdwn', text: '*Page*\\n' + (c.page_url || 'unknown') }, { type: 'mrkdwn', text: '*Confidence*\\n' + c.confidence }, { type: 'mrkdwn', text: '*Touches money*\\n' + (c.touches_money ? 'yes' : 'no') } ] }, { type: 'section', text: { type: 'mrkdwn', text: '*Why a human*\\n' + c.handover_reason } }, { type: 'section', text: { type: 'mrkdwn', text: '*Question*\\n' + String(c.message).slice(0, 900) } } ] }; })()) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1960,
+        200
+      ],
+      "id": "h-0017-4a1b-9c2d-000000000017",
+      "name": "Alert The Review Channel",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Both outputs land on the same recorder below: the ticket is already in the queue whether or not Slack took the message, and the log has to say which."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The alert either landed or it did not, and the decision row says so. A\n-- failures table that only contains the failures you were successfully told\n-- about is not a failures table.\nUPDATE support_decisions\n   SET integration_error = $2\n WHERE decision_key = $1\n   AND $2 IS NOT NULL\nRETURNING id, integration_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Reply Ready').first().json.decision_key, $json.error ? 'Alert The Review Channel - ' + String($json.error.message || 'failed').slice(0, 200) : null ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2180,
+        200
+      ],
+      "id": "p-0018-4a1b-9c2d-000000000018",
+      "name": "Record Alert Outcome",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - support ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "Updates nothing on the happy path, which is why alwaysOutputData is on."
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1740,
+        400
+      ],
+      "id": "n-0019-4a1b-9c2d-000000000019",
+      "name": "Answered Without A Human",
+      "notes": "The branch that needed nobody. Kept as a node rather than left dangling so the canvas shows the good path ending deliberately."
+    }
+  ],
+  "connections": {
+    "Chat Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Shared Secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Shared Secret": {
+      "main": [
+        [
+          {
+            "node": "Open Or Touch Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Or Touch Session": {
+      "main": [
+        [
+          {
+            "node": "Load Recent Turns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Recent Turns": {
+      "main": [
+        [
+          {
+            "node": "Build Engine Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Engine Request": {
+      "main": [
+        [
+          {
+            "node": "Ask The Answer Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask The Answer Engine": {
+      "main": [
+        [
+          {
+            "node": "Combine Answer And Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Answer And Session": {
+      "main": [
+        [
+          {
+            "node": "Confidence Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Gate": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Handover Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Reply": {
+      "main": [
+        [
+          {
+            "node": "Reply Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Handover Reply": {
+      "main": [
+        [
+          {
+            "node": "Reply Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply Ready": {
+      "main": [
+        [
+          {
+            "node": "Respond To Visitor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond To Visitor": {
+      "main": [
+        [
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Decision": {
+      "main": [
+        [
+          {
+            "node": "Persist Both Turns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Both Turns": {
+      "main": [
+        [
+          {
+            "node": "Needs A Human?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs A Human?": {
+      "main": [
+        [
+          {
+            "node": "Queue For A Human",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Answered Without A Human",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Queue For A Human": {
+      "main": [
+        [
+          {
+            "node": "Alert The Review Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert The Review Channel": {
+      "main": [
+        [
+          {
+            "node": "Record Alert Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Alert Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_WITH_WORKFLOW_04_ID",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 120
+  },
+  "pinData": {}
+}
