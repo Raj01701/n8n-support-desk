@@ -58,6 +58,14 @@ sub-workflow of the rows above; 20 is the Error Trigger firing for execution 19.
 
 <p align="center"><img src="docs/screenshots/01-executions-list.png" width="900" alt="n8n executions list"></p>
 
+**The three canvases**, as n8n draws them — the email agent, the shared answer
+engine, and the chat agent. Every green edge is a node that actually ran in that
+execution.
+
+<p align="center"><img src="docs/screenshots/02-support-email-answered.png" width="900" alt="Workflow 01 canvas, a support email answered"></p>
+<p align="center"><img src="docs/screenshots/08-answer-engine-canvas.png" width="900" alt="Workflow 03 canvas, the shared answer engine"></p>
+<p align="center"><img src="docs/screenshots/13-chat-agent-canvas.png" width="900" alt="Workflow 02 canvas, the live chat agent"></p>
+
 **A question answered from the business, not from the model.** The customer asked
 how to turn on two-factor authentication. Retrieval found article 9, the model
 was given that passage and nothing else, and the four fields the brief names are
