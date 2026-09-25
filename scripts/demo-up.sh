@@ -64,7 +64,10 @@ for _ in $(seq 1 90); do
   status="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H 'content-type: application/json' -H 'browser-id: demo-script' -d '{}' \
     "http://127.0.0.1:$N8N_HOST_PORT/rest/owner/setup")"
-  [[ "$status" != "404" ]] && break
+  # 404 means the controller is not mounted yet; 000 means curl could not even
+  # connect. Anything else - including the 400 an empty body earns - means the
+  # route is live.
+  [[ "$status" != "404" && "$status" != "000" ]] && break
   sleep 1
 done
 

@@ -112,6 +112,8 @@ function record(name, heading, asserted, observed, execution) {
     asserted,
     observed,
     execution_id: execution?.id ?? null,
+    workflow_id: execution?.workflowId ?? null,
+    workflow_name: execution ? nameOf(execution) : null,
     status: execution?.status ?? null,
     ms: execution ? durationMs(execution) : null,
   });

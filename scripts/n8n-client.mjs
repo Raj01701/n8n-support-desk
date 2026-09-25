@@ -21,23 +21,40 @@ export async function login({ email, password }) {
   return cookie;
 }
 
-export async function setupOwner({ email, password, firstName, lastName }) {
-  const res = await fetch(`${BASE}/rest/owner/setup`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'browser-id': 'demo-script' },
-    body: JSON.stringify({ email, password, firstName, lastName }),
-  });
-  const text = await res.text();
-  if (res.ok) {
-    cookie = (res.headers.get('set-cookie') || '').split(';')[0];
-    return { created: true };
+export async function setupOwner({ email, password, firstName, lastName }, { retries = 60 } = {}) {
+  // n8n answers /healthz while it is still running database migrations, and
+  // mounts its REST controllers only afterwards - so for the first ten to
+  // thirty seconds of a cold start every /rest route 404s with an Express
+  // "Cannot POST" page. Retrying on a 404 is the difference between a demo-up
+  // that works on a warm machine and one that works on any machine.
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await fetch(`${BASE}/rest/owner/setup`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'browser-id': 'demo-script' },
+      body: JSON.stringify({ email, password, firstName, lastName }),
+    });
+    const text = await res.text();
+
+    if (res.ok) {
+      cookie = (res.headers.get('set-cookie') || '').split(';')[0];
+      return { created: true };
+    }
+
+    if (res.status === 404 && attempt < retries) {
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+
+    // Already set up on a previous run - fall back to logging in. Matched on
+    // n8n's actual wording, not on the word "setup", which also appears in the
+    // 404 page for /rest/owner/setup itself.
+    if (/instance owner already setup|already been set up|already exists/i.test(text)) {
+      await login({ email, password });
+      return { created: false };
+    }
+
+    throw new Error(`owner setup failed: ${res.status} ${text.slice(0, 300)}`);
   }
-  // Already set up on a previous run - fall back to logging in.
-  if (/already|setup/i.test(text)) {
-    await login({ email, password });
-    return { created: false };
-  }
-  throw new Error(`owner setup failed: ${res.status} ${text}`);
 }
 
 export async function api(path, options = {}) {
