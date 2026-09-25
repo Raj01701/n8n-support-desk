@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harbourly — chat widget demo</title>
+<!--
+  A stand-in for the client's marketing site, so the widget can be demonstrated
+  on something that looks like a page rather than on a blank document.
+
+  Open it straight off disk (file://) or serve it with any static server. The
+  only thing that matters is the two data- attributes on the script tag at the
+  bottom: point data-endpoint at workflow 02's production webhook and
+  data-secret at the value of CHAT_WEBHOOK_SECRET.
+
+  The defaults below are the local demo stack's.
+-->
+<style>
+  :root{
+    --bg:#0a0c14; --panel:#11141f; --line:rgba(255,255,255,.08);
+    --ink:#e8ebf2; --muted:#8b93a8; --accent:#6d8cff; --accent-2:#46d08a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;
+       background:radial-gradient(900px 480px at 78% -8%,rgba(109,140,255,.16),transparent 60%),
+                  radial-gradient(700px 420px at 4% 104%,rgba(70,208,138,.09),transparent 60%)}
+  .wrap{position:relative;max-width:1060px;margin:0 auto;padding:0 24px}
+  nav{display:flex;align-items:center;gap:28px;padding:26px 0;border-bottom:1px solid var(--line)}
+  .logo{display:flex;align-items:center;gap:10px;font-weight:660;letter-spacing:-.02em;font-size:18px}
+  .mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(140deg,var(--accent),#3a4bb5);
+        box-shadow:0 6px 18px rgba(109,140,255,.35)}
+  nav a{color:var(--muted);text-decoration:none;font-size:14.5px}
+  nav a:hover{color:var(--ink)}
+  nav .spacer{margin-left:auto}
+  .cta{background:var(--accent);color:#0d1020;padding:8px 16px;border-radius:9px;font-weight:600;font-size:14.5px}
+
+  header{padding:88px 0 64px;max-width:660px}
+  .eyebrow{display:inline-block;font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;
+           color:var(--accent-2);border:1px solid rgba(70,208,138,.3);border-radius:999px;padding:4px 12px}
+  h1{font-size:clamp(34px,5.2vw,54px);line-height:1.07;letter-spacing:-.03em;margin:20px 0 18px;font-weight:680}
+  h1 em{font-style:normal;background:linear-gradient(100deg,var(--accent),var(--accent-2));
+        -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{color:var(--muted);font-size:18.5px;max-width:540px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px;padding-bottom:72px}
+  .card{background:linear-gradient(160deg,rgba(255,255,255,.045),rgba(255,255,255,.015));
+        border:1px solid var(--line);border-radius:14px;padding:22px}
+  .card h3{margin:0 0 8px;font-size:16px;font-weight:620;letter-spacing:-.01em}
+  .card p{margin:0;color:var(--muted);font-size:14.5px}
+
+  .try{border:1px solid var(--line);border-radius:16px;padding:26px 28px;background:var(--panel);margin-bottom:80px}
+  .try h2{margin:0 0 6px;font-size:19px;letter-spacing:-.015em}
+  .try p{margin:0 0 18px;color:var(--muted);font-size:14.5px}
+  .chips{display:flex;flex-wrap:wrap;gap:9px}
+  .chip{background:#171c2a;border:1px solid var(--line);color:var(--ink);border-radius:999px;
+        padding:8px 14px;font:inherit;font-size:14px;cursor:pointer;text-align:left}
+  .chip:hover{border-color:var(--accent);color:#fff}
+  .chip small{display:block;color:var(--muted);font-size:11.5px;margin-top:2px}
+  footer{border-top:1px solid var(--line);padding:26px 0 120px;color:var(--muted);font-size:13.5px}
+  code{background:#171c2a;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <span class="logo"><span class="mark"></span> Harbourly</span>
+    <a href="#">Product</a><a href="#">Pricing</a><a href="#">Docs</a>
+    <span class="spacer"></span>
+    <a class="cta" href="#">Start free</a>
+  </nav>
+
+  <header>
+    <span class="eyebrow">Demo page</span>
+    <h1>Invoicing that <em>chases the money</em> for you.</h1>
+    <p class="lede">
+      Harbourly is the fictional small SaaS this support desk was built for. The
+      page exists so the chat widget has somewhere real to sit — the bubble in
+      the bottom right is the actual widget, talking to the actual n8n workflow.
+    </p>
+  </header>
+
+  <section class="grid">
+    <div class="card"><h3>Same backend as email</h3>
+      <p>The widget posts to workflow 02, which calls the same answer engine workflow 01 calls for Gmail. One knowledge base, one gate, two doors.</p></div>
+    <div class="card"><h3>Answers in the same request</h3>
+      <p>No polling and no websocket. The reply comes back in the body of the widget's own POST, and the widget prints how long it took.</p></div>
+    <div class="card"><h3>Says when it does not know</h3>
+      <p>If nothing in the help centre covers the question, it says so, offers a person, and writes the question down so somebody can write that article.</p></div>
+  </section>
+
+  <section class="try">
+    <h2>Try it</h2>
+    <p>These open the widget and send the question for you. The last two are the interesting ones.</p>
+    <div class="chips">
+      <button class="chip" data-ask="How long is the free trial and what happens when it ends?">
+        How long is the free trial?<small>answered from the knowledge base</small></button>
+      <button class="chip" data-ask="Can my clients pay an invoice by card?">
+        Can clients pay by card?<small>answered from the knowledge base</small></button>
+      <button class="chip" data-ask="I was charged twice this month, can I get a refund?">
+        I was charged twice — refund?<small>touches money, so a human takes it</small></button>
+      <button class="chip" data-ask="Do you have an Android app with offline receipt scanning?">
+        Android app with offline scanning?<small>nothing in the help centre covers it</small></button>
+    </div>
+  </section>
+
+  <footer>
+    Wire it into a real site by copying <code>chat-widget.js</code> next to your
+    other assets and pasting the one <code>&lt;script&gt;</code> tag at the bottom
+    of this file into your layout. Nothing else on the page changes.
+  </footer>
+</div>
+
+<script>
+  document.querySelectorAll('.chip').forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      window.HarbourlyChat.ask(chip.getAttribute('data-ask'));
+    });
+  });
+</script>
+
+<script src="chat-widget.js"
+        data-endpoint="http://localhost:5681/webhook/chat/message"
+        data-secret="local-demo-chat-widget-secret"
+        data-title="Harbourly Support"
+        data-subtitle="Answers from our help centre, instantly"
+        data-greeting="Hi — ask me anything about invoices, plans, payments or your account."
+        defer></script>
+</body>
+</html>
