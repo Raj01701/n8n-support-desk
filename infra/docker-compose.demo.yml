@@ -1,0 +1,75 @@
+########################################################################
+# Demo overlay. This is what docs/screenshots and docs/walkthrough.mp4
+# were recorded against.
+#
+#   cd infra
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml \
+#     --env-file .env.demo up -d
+#
+# It differs from the production file in exactly four ways, all of them
+# because there is no Google account and no model provider here:
+#
+#   1. Postgres is published on 127.0.0.1:15681 so the proof queries can
+#      be run from the host.
+#   2. A `mock` service answers the Gmail API, the OpenAI-compatible
+#      chat-completions endpoint and the Slack incoming webhooks.
+#   3. The model and Slack are reached through LLM_API_BASE and the
+#      SLACK_*_WEBHOOK_URL variables the workflows already use, so no
+#      node parameter changes for those.
+#   4. Gmail. n8n's Gmail node and Gmail Trigger have no base-URL
+#      setting - they always call https://www.googleapis.com. So that
+#      name (and the OAuth token endpoint) is mapped to the mock
+#      container's address and TLS verification is turned off inside the
+#      n8n container. That is a demo-only shortcut; it is the only
+#      reason NODE_TLS_REJECT_UNAUTHORIZED appears anywhere in this repo.
+#
+# The Gmail *node* is real in every screenshot. What is mocked is the
+# server on the other end of it.
+########################################################################
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:15681:5432"
+
+  n8n:
+    environment:
+      N8N_SECURE_COOKIE: "false"
+      # Demo only: the mock Gmail listener uses a self-signed certificate.
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    extra_hosts:
+      # The Gmail node cannot be pointed anywhere else, so point DNS instead.
+      - "www.googleapis.com:172.31.10.10"
+      - "oauth2.googleapis.com:172.31.10.10"
+    networks: [supportnet, mocknet]
+
+  mock:
+    image: node:22-alpine
+    restart: unless-stopped
+    command: ["node", "/app/server.mjs"]
+    working_dir: /app
+    environment:
+      MOCK_HTTP_PORT: 4000
+      MOCK_TLS_PORT: 443
+      MOCK_TLS_DIR: /tls
+    volumes:
+      - ../test/mocks:/app:ro
+      - ../test/mocks/tls:/tls:ro
+    ports:
+      # Only the control plane and the request log are needed from the host.
+      - "127.0.0.1:4181:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      supportnet:
+      mocknet:
+        ipv4_address: 172.31.10.10
+
+networks:
+  mocknet:
+    ipam:
+      config:
+        - subnet: 172.31.10.0/24

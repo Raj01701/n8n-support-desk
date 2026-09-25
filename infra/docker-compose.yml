@@ -1,0 +1,159 @@
+########################################################################
+# Self-hosted n8n for the support desk.
+#
+#   cd infra
+#   cp .env.example .env     # fill it in, then:
+#   docker compose up -d
+#   open http://localhost:${N8N_HOST_PORT:-5681}
+#
+# Two Postgres databases live in one server: n8n's own (workflows,
+# executions, encrypted credentials) and support_ops (sql/schema.sql -
+# the knowledge base, the decision log, the chat transcript, the review
+# queue and the failures table). db/init runs once, on the first boot of
+# an empty volume, and creates the second one.
+#
+# The project name and the published port are deliberately distinct from
+# every other n8n stack on this machine. Two n8n instances sharing a
+# compose project name share volumes, and the second one to start then
+# silently inherits the first one's encryption key and workflows.
+#
+# There is no TLS here on purpose. Put this behind a reverse proxy you
+# already run (Caddy, Traefik, nginx), or in front of a managed host that
+# terminates TLS for you. WEBHOOK_URL must be the public HTTPS origin or
+# the chat widget will be handed a URL it cannot reach.
+########################################################################
+
+name: n8n-support
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    # Pinned. n8n 2.x warns on Postgres 16 and older; minor upgrades are
+    # safe, major ones need a dump and restore.
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      SUPPORT_OPS_DB: ${SUPPORT_OPS_DB}
+      # Fail fast on a weak setup rather than silently allowing trust auth.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      # Mounted outside initdb.d on purpose: the schema belongs to
+      # support_ops only, never to n8n's own database.
+      - ../sql/schema.sql:/schema/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [supportnet]
+
+  n8n:
+    # Pin the version you tested. "latest" means an unattended restart can
+    # change node behaviour at 3am. github.com/n8n-io/n8n/releases
+    image: docker.n8n.io/n8nio/n8n:2.40.5
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- identity / URLs -------------------------------------------------
+      N8N_PORT: 5678
+      N8N_EDITOR_BASE_URL: ${N8N_PUBLIC_URL}
+      # The origin the chat widget and Google use. If this is wrong, the
+      # production webhook URL n8n prints is the container's internal
+      # address and the widget posts into the void.
+      WEBHOOK_URL: ${N8N_PUBLIC_URL}
+      N8N_PROXY_HOPS: ${N8N_PROXY_HOPS}
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL}
+
+      # --- secrets ---------------------------------------------------------
+      # Credentials in the database are encrypted with this key. Lose it and
+      # every stored credential is unrecoverable; change it and n8n refuses
+      # to start against an existing database. It belongs in your backup.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      # --- persistence -----------------------------------------------------
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: public
+
+      # --- execution data pruning -----------------------------------------
+      # Without this the execution tables grow without limit and eventually
+      # the disk, not the workflow, is what takes support down.
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_DATA_MAX_AGE}
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: ${EXECUTIONS_DATA_PRUNE_MAX_COUNT}
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "true"
+
+      # --- Code node requirements -----------------------------------------
+      # The chat webhook verifies its shared secret with crypto.timingSafeEqual
+      # in a Code node, and several Code nodes read {{ $env.X }}. Newer n8n
+      # blocks both unless told otherwise.
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+      # --- application env read by the workflows via {{ $env.X }} ----------
+      BUSINESS_NAME: ${BUSINESS_NAME}
+      BUSINESS_SUPPORT_EMAIL: ${BUSINESS_SUPPORT_EMAIL}
+      LLM_API_BASE: ${LLM_API_BASE}
+      LLM_MODEL: ${LLM_MODEL}
+      SUPPORT_CONFIDENCE_THRESHOLD: ${SUPPORT_CONFIDENCE_THRESHOLD}
+      KB_RELEVANCE_FLOOR: ${KB_RELEVANCE_FLOOR}
+      KB_TOP_K: ${KB_TOP_K}
+      CHAT_HISTORY_TURNS: ${CHAT_HISTORY_TURNS}
+      EMAIL_HISTORY_TURNS: ${EMAIL_HISTORY_TURNS}
+      CHAT_WEBHOOK_SECRET: ${CHAT_WEBHOOK_SECRET}
+      GMAIL_NOT_SUPPORT_LABEL_ID: ${GMAIL_NOT_SUPPORT_LABEL_ID}
+      GMAIL_NEEDS_HUMAN_LABEL_ID: ${GMAIL_NEEDS_HUMAN_LABEL_ID}
+      GMAIL_AUTO_REPLIED_LABEL_ID: ${GMAIL_AUTO_REPLIED_LABEL_ID}
+      SLACK_HUMAN_REVIEW_WEBHOOK_URL: ${SLACK_HUMAN_REVIEW_WEBHOOK_URL}
+      SLACK_ALERTS_WEBHOOK_URL: ${SLACK_ALERTS_WEBHOOK_URL}
+
+      # --- housekeeping ----------------------------------------------------
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      TZ: ${GENERIC_TIMEZONE}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      N8N_PAYLOAD_SIZE_MAX: 16
+      N8N_RUNNERS_ENABLED: "true"
+    ports:
+      - "127.0.0.1:${N8N_HOST_PORT}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Read-only so `n8n import:workflow` imports the repository's files
+      # rather than a copy someone edited inside the container.
+      - ../workflows:/workflows:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [supportnet]
+
+networks:
+  supportnet:
+
+volumes:
+  postgres_data:
+  n8n_data:

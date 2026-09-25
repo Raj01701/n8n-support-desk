@@ -1,0 +1,13 @@
+{
+  "name": "n8n-support-desk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "One n8n support desk across Gmail and live chat: an email agent that replies in-thread, a website chat widget, and the one shared answer engine both of them call.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/validate.mjs",
+    "mocks": "node test/mocks/server.mjs"
+  },
+  "license": "MIT"
+}
